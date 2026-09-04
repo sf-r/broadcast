@@ -279,10 +279,11 @@ function withTimeout(promise, ms, label = '작업') {
  * 통째로 생략됩니다. cache.put()은 ctx.waitUntil로 넘겨서 응답을 기다리게
  * 하지 않습니다.
  */
-async function fetchImageAsDataUri(url, ctx) {
+async function fetchImageAsDataUri(url, ctx, width, height) {
   const cache = caches.default;
-  // 원본 바이트가 아니라 "완성된 data URI"를 캐싱한다는 걸 키에서도 구분되게
-  const cacheKey = new Request(`${url}#datauri`, { method: 'GET' });
+  // 원본 바이트가 아니라 "완성된 data URI"를 캐싱한다는 걸 키에서도 구분되게.
+  // 캔버스 크기(w/h)별로 리사이즈 결과가 다르므로 크기도 캐시 키에 포함.
+  const cacheKey = new Request(`${url}#datauri:${width}x${height}`, { method: 'GET' });
 
   console.time('[broadcast]   bg fetch+encode');
   if (ctx) {
@@ -295,7 +296,24 @@ async function fetchImageAsDataUri(url, ctx) {
     }
   }
 
-  const res = await fetch(url);
+  // Cloudflare Image Transformations(구 Image Resizing)로 원본을 캔버스 크기에
+  // 맞춰 미리 축소·크롭해서 받아옵니다. 이 리사이즈는 Cloudflare 엣지에서
+  // 처리되어 이 Worker의 CPU 시간을 전혀 쓰지 않고, 월 5,000회까지 무료입니다
+  // (Free 플랜 포함). 원본을 그대로 받아 satori/resvg가 고해상도를 직접
+  // 디코딩·리샘플링하면서 CPU 한도를 초과하던 문제를 근본적으로 우회합니다.
+  // 만약 해당 zone에서 아직 Transformations가 꺼져 있다면 원본이 그대로
+  // 내려올 수 있으니, 대시보드에서 Speed → Optimization(또는 Images →
+  // Transformations)에서 켜져 있는지 확인하세요.
+  const res = await fetch(url, {
+    cf: {
+      image: {
+        width,
+        height,
+        fit: 'cover', // 기존 CSS의 object-fit:cover와 동일한 크롭 방식으로 통일
+        format: 'png', // satori가 webp를 못 읽는 문제 회피 (원본이 webp/jpeg 등이어도 png로 통일)
+      },
+    },
+  });
   if (!res.ok) {
     throw new Error(`배경 이미지를 가져오지 못했습니다 (${res.status}): ${url}`);
   }
@@ -586,7 +604,10 @@ async function handleBroadcast(url, env, ctx) {
   // CPU 시간을 잡아먹는지 확인하기 위한 임시 로그. wrangler tail이나
   // 대시보드 Logs 스트림에서 확인 후, 원인 파악되면 지워도 됩니다.
   console.time('[broadcast] fonts+bg');
-  const [fonts, bgDataUri] = await Promise.all([loadFonts(), fetchImageAsDataUri(bgUrl, ctx)]);
+  const [fonts, bgDataUri] = await Promise.all([
+    loadFonts(),
+    fetchImageAsDataUri(bgUrl, ctx, width, height),
+  ]);
   console.timeEnd('[broadcast] fonts+bg');
 
   const markupStr = renderBroadcastMarkup({
