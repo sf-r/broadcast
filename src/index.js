@@ -110,15 +110,18 @@ async function ensureResvg() {
 
 async function svgToPng(svg, width) {
   await ensureResvg();
+  console.log(`[broadcast]     resvg wasm 준비 완료, svg 길이=${svg.length}`);
   // satori가 이미 모든 텍스트를 HarfBuzz로 셰이핑해서 <path>로 구워 넣은
   // SVG를 넘기므로, resvg 쪽에서 폰트를 다시 찾을 일이 없습니다.
   // loadSystemFonts: false로 그 탐색(꽤 IO 비용이 큼) 자체를 건너뜁니다.
-  return new Resvg(svg, {
+  const rendered = new Resvg(svg, {
     fitTo: { mode: 'width', value: width },
     font: { loadSystemFonts: false },
-  })
-    .render()
-    .asPng();
+  }).render();
+  console.log('[broadcast]     resvg render() 완료, asPng 시작');
+  const png = rendered.asPng();
+  console.log('[broadcast]     resvg asPng 완료');
+  return png;
 }
 
 function escapeHtml(s) {
@@ -217,16 +220,21 @@ async function subsetFontsForMarkup(fonts, markupHtml) {
   const chars = extractRenderableChars(markupHtml);
   if (!chars) return fonts;
   try {
-    console.time('[broadcast]   font subset');
+    console.log(`[broadcast]   font subset 시작 (chars=${chars.length}, weights=${fonts.length})`);
     const subsetted = await Promise.all(
-      fonts.map(async (f) => ({
-        ...f,
-        data: toArrayBuffer(
-          await subsetFont(Buffer.from(f.data), chars, { targetFormat: 'sfnt' })
-        ),
-      }))
+      fonts.map(async (f) => {
+        console.log(`[broadcast]     subsetFont 시작 weight=${f.weight}`);
+        const result = {
+          ...f,
+          data: toArrayBuffer(
+            await subsetFont(Buffer.from(f.data), chars, { targetFormat: 'sfnt' })
+          ),
+        };
+        console.log(`[broadcast]     subsetFont 완료 weight=${f.weight}`);
+        return result;
+      })
     );
-    console.timeEnd('[broadcast]   font subset');
+    console.log('[broadcast]   font subset 완료');
     return subsetted;
   } catch (err) {
     // 서브셋 실패해도 렌더링은 계속 진행 — 원본(풀) 폰트로 폴백합니다.
@@ -600,15 +608,21 @@ async function handleBroadcast(url, env, ctx) {
   const bgUrl = `${bgBase.replace(/\/$/, '')}/bro/${encodeURIComponent(char)}-${encodeURIComponent(situation)}.png`;
 
   // --- 타이밍 계측 시작 -----------------------------------------------
-  // 어느 단계(폰트+배경이미지 로딩 / satori 레이아웃 / resvg 래스터라이즈)가
-  // CPU 시간을 잡아먹는지 확인하기 위한 임시 로그. wrangler tail이나
-  // 대시보드 Logs 스트림에서 확인 후, 원인 파악되면 지워도 됩니다.
-  console.time('[broadcast] fonts+bg');
+  // 어느 단계(폰트+배경이미지 로딩 / 폰트 서브셋 / satori 레이아웃 / resvg
+  // 래스터라이즈)가 CPU 시간을 잡아먹는지 확정하기 위한 체크포인트 로그.
+  //
+  // 주의: console.time()은 "호출 시점"엔 아무 로그도 안 남기고, 반드시
+  // console.timeEnd()까지 끝나야만 한 줄이 찍힙니다. 그래서 CPU 한도로
+  // 죽어버리는 요청은 마지막으로 진입한 단계의 timeEnd가 영원히 안 찍히고,
+  // 심지어 그 전 단계까지도 로그가 하나도 안 남을 수 있어 "어디서 죽었는지"를
+  // 알 수가 없었습니다. 아래는 각 단계 "시작 시점"에 즉시 찍히는 console.log
+  // 체크포인트라서, 죽기 직전 로그에 찍힌 마지막 단계가 곧 범인입니다.
+  console.log('[broadcast] step: fonts+bg 시작');
   const [fonts, bgDataUri] = await Promise.all([
     loadFonts(),
     fetchImageAsDataUri(bgUrl, ctx, width, height),
   ]);
-  console.timeEnd('[broadcast] fonts+bg');
+  console.log('[broadcast] step: fonts+bg 완료');
 
   const markupStr = renderBroadcastMarkup({
     width,
@@ -627,15 +641,17 @@ async function handleBroadcast(url, env, ctx) {
 
   // satori에 넘기기 직전, 이 화면에 실제로 쓰이는 글자만 남긴 서브셋 폰트로
   // 교체 — CPU 타임아웃의 유력 원인이었던 "매 요청 풀 폰트 파싱"을 줄입니다.
+  console.log('[broadcast] step: font subset 시작');
   const renderFonts = await subsetFontsForMarkup(fonts, markupStr);
+  console.log('[broadcast] step: font subset 완료');
 
-  console.time('[broadcast] satori');
+  console.log('[broadcast] step: satori 시작');
   const svg = await satori(markup, { width, height, fonts: renderFonts });
-  console.timeEnd('[broadcast] satori');
+  console.log('[broadcast] step: satori 완료');
 
-  console.time('[broadcast] resvg');
+  console.log('[broadcast] step: resvg 시작');
   const png = await svgToPng(svg, width);
-  console.timeEnd('[broadcast] resvg');
+  console.log('[broadcast] step: resvg 완료');
   // --- 타이밍 계측 끝 ---------------------------------------------------
 
   return png;
