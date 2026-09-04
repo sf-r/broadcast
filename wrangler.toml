@@ -1,0 +1,36 @@
+name = "broadcast"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 플랫폼 레벨 CPU 시간 하드 한도. 코드 안의 애플리케이션 레벨 타임아웃
+# (25초, index.js의 RENDER_TIMEOUT_MS)이 대부분의 경우 이보다 먼저 걸려서
+# 정상적인 에러 응답(504)을 내겠지만, 순수 동기 연산 구간처럼 JS 타이머로
+# 선점이 안 되는 경우를 대비한 최후의 안전장치입니다. 이 값을 넘기면
+# Cloudflare가 요청을 강제 종료합니다("Worker exceeded CPU time limit").
+[limits]
+cpu_ms = 30000
+
+# .wasm 파일을 바로 import 할 수 있게 해주는 규칙 (resvg-wasm용)
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = true
+
+# 아바타 이미지를 다른 도메인/버킷에서 서빙한다면 여기에 지정
+# (지정 안 하면 코드에서 {origin}/avatars 를 기본값으로 사용)
+[vars]
+AVATAR_BASE_URL = ""
+# /gg/broadcast 의 배경 이미지 베이스 (R2가 연결된 내 도메인)
+# 실제 경로: {SAFFRAN_BASE_URL}/bro/{캐릭터코드}-{상황코드}.webp
+SAFFRAN_BASE_URL = "https://saffran.kr"
+
+# 생성된 이미지를 암호화해서 보관하는 R2 버킷 (내용/파일명 모두 오브퍼스케이션됨)
+# 사전에 버킷 생성 필요: npx wrangler r2 bucket create rplay-broadcast-images
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "rplay-broadcast-images"
+
+# ENCRYPTION_KEY는 여기(파일)에 넣지 말고 시크릿으로 등록:
+#   openssl rand -base64 32
+#   npx wrangler secret put ENCRYPTION_KEY

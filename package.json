@@ -1,0 +1,18 @@
+{
+  "name": "broadcast",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "satori": "^0.10.13",
+    "satori-html": "^0.3.2",
+    "@resvg/resvg-wasm": "^2.6.2",
+    "subset-font": "^2.5.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
