@@ -132,6 +132,28 @@ function escapeHtml(s) {
     .replaceAll('"', '&quot;');
 }
 
+// 배경 이미지 자리표시자 — renderBroadcastMarkup()이 만드는 HTML 문자열에는
+// 이 짧은 문자열만 들어가고, 실제 base64 데이터 URI는 html() 파싱이 끝난
+// 뒤 replaceImgSrc()로 VDOM 트리에 직접 주입합니다.
+const BG_IMG_PLACEHOLDER = 'about:blank#bg-image-placeholder';
+
+// satori-html이 만든 VDOM({ type, props: { style?, children?, ... } })을
+// 재귀적으로 훑어서, src가 placeholder와 일치하는 <img> 노드의 src를
+// 실제 값으로 바꿔치기합니다. children은 문자열 / 단일 노드 / 배열 중
+// 하나일 수 있어서 셋 다 처리합니다.
+function replaceImgSrc(node, targetSrc, replacement) {
+  if (!node || typeof node !== 'object') return;
+  if (node.type === 'img' && node.props && node.props.src === targetSrc) {
+    node.props.src = replacement;
+  }
+  const children = node.props && node.props.children;
+  if (Array.isArray(children)) {
+    for (const child of children) replaceImgSrc(child, targetSrc, replacement);
+  } else if (children && typeof children === 'object') {
+    replaceImgSrc(children, targetSrc, replacement);
+  }
+}
+
 function formatCount(n, unit = '') {
   if (!Number.isFinite(n)) return '0' + unit;
   if (n >= 10000) {
@@ -627,7 +649,13 @@ async function handleBroadcast(url, env, ctx) {
   const markupStr = renderBroadcastMarkup({
     width,
     height,
-    bgDataUri,
+    // 실제 base64 데이터 URI(수백KB~수MB짜리 긴 문자열) 대신 짧은 자리표시자를
+    // 넣습니다. satori-html의 html()은 내부적으로 ultrahtml 파서로 이 문자열
+    // 전체를 파싱하는데, <img src="..."> 속성값이 이렇게 거대하면 파서가
+    // 비정상적으로 느려지는 사례가 알려져 있습니다(예: sanitize-html #619류
+    // 이슈). 실제 이미지 데이터는 파싱이 끝난 뒤 트리에 직접 주입해서
+    // 파서가 그 긴 문자열을 아예 보지 않게 합니다.
+    bgDataUri: BG_IMG_PLACEHOLDER,
     title,
     streamer,
     viewers,
@@ -637,7 +665,11 @@ async function handleBroadcast(url, env, ctx) {
   });
   // html()을 "함수 호출"로 사용 — 완성된 문자열을 그대로 파싱, 자동 이스케이프 없음
   // (그래서 채팅 줄 안의 <div>/<span> 태그가 실제 엘리먼트로 정상 렌더링됩니다)
+  console.log(`[broadcast] step: html() 파싱 시작, markupStr 길이=${markupStr.length}`);
   const markup = html(markupStr);
+  console.log('[broadcast] step: html() 파싱 완료');
+  // 파서를 거치지 않고, 파싱된 VDOM 트리에서 자리표시자를 실제 데이터 URI로 교체
+  replaceImgSrc(markup, BG_IMG_PLACEHOLDER, bgDataUri);
 
   // satori에 넘기기 직전, 이 화면에 실제로 쓰이는 글자만 남긴 서브셋 폰트로
   // 교체 — CPU 타임아웃의 유력 원인이었던 "매 요청 풀 폰트 파싱"을 줄입니다.
