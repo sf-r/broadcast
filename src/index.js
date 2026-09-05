@@ -282,7 +282,13 @@ async function subsetFontsForMarkup(fonts, markupHtml) {
     return subsetted;
   } catch (err) {
     // 서브셋 실패해도 렌더링은 계속 진행 — 원본(풀) 폰트로 폴백합니다.
-    console.error('[font subset 실패, 풀 폰트로 폴백]', err);
+    // 이 폴백 자체는 기능적으로 문제가 없으므로(이미지는 정상 생성됨)
+    // error가 아니라 warn 레벨로 남겨서 Cloudflare 대시보드의 에러 집계/
+    // 알림에 잡히지 않게 합니다. 원인 진단용으로 실제 에러 메시지만 짧게
+    // 붙입니다 — 이 로그가 반복해서 계속 찍히면(=서브셋이 매번 실패하면)
+    // CPU 타임아웃 방지 최적화가 무력화된 상태라는 뜻이니 그때는 원인을
+    // 들여다볼 필요가 있습니다.
+    console.warn(`[font subset 스킵, 풀 폰트로 폴백] ${err?.message || err}`);
     return fonts;
   }
 }
