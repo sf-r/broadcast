@@ -742,6 +742,34 @@ async function decryptBytes(buf, key) {
   return new Uint8Array(plain);
 }
 
+// ------------------------------------------------------------------
+// 3-1) 요청 파라미터 기반 "결정론적" R2 키 (중복 누적 방지)
+// ------------------------------------------------------------------
+//
+// 기존에는 매 요청마다 crypto.randomUUID()로 완전히 새 키를 만들어 저장했기
+// 때문에, 같은 장면(같은 파라미터)이 다시 요청될 때마다 — 예를 들어
+// 클라이언트가 이미 생성된 이미지를 확대해서 다시 불러오거나, 캐릭터 AI 챗
+// 히스토리를 다시 렌더링하면서 마크다운 이미지 URL(=같은 쿼리 파라미터)을
+// 재요청하는 경우 — 내용은 완전히 동일한데 키만 다른 사본이 R2에 계속
+// 추가로 쌓였습니다.
+//
+// 아래 함수는 URL의 쿼리 파라미터를 key 기준으로 정렬해 정규화한 뒤
+// SHA-256 해시를 구해, 그 값 자체를 R2 오브젝트 키(= /gg/img/{id}의 id)로
+// 씁니다. 같은 파라미터 조합은 항상 같은 id로 귀결되므로:
+//   - 처음 보는 조합  -> 새로 렌더링해서 그 id로 저장
+//   - 이미 본 조합    -> 렌더링 자체를 생략하고 기존 오브젝트를 복호화해서
+//                        그대로 서빙 (CPU 절약 + R2에 중복 저장 안 됨)
+// 해시는 일방향이라, id만 봐서는(기존 랜덤 UUID와 마찬가지로) 어떤
+// char/situation/title/chat 조합이었는지 역산할 수 없습니다 — R2 버킷을
+// 들여다봐도 내용을 알 수 없다는 기존 목적은 그대로 유지됩니다.
+async function canonicalRequestId(url) {
+  const sortedParams = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const canonical = sortedParams.map(([k, v]) => `${k}=${v}`).join('&');
+  const data = new TextEncoder().encode(`${url.pathname}?${canonical}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 /**
  * 주어진 id로 PNG를 암호화해서 R2에 저장합니다. id는 호출자(라우터)가
  * crypto.randomUUID()로 미리 만들어 응답 헤더(x-image-id)에 즉시 실어
@@ -791,12 +819,9 @@ export default {
         return await handleStoredImage(url, env);
       }
 
-      let png;
-      if (url.pathname.startsWith('/gg/accounts')) {
-        png = await withTimeout(handleAccounts(url, env), RENDER_TIMEOUT_MS, '/gg/accounts 이미지 생성');
-      } else if (url.pathname.startsWith('/gg/broadcast')) {
-        png = await withTimeout(handleBroadcast(url, env, ctx), RENDER_TIMEOUT_MS, '/gg/broadcast 이미지 생성');
-      } else {
+      const isAccounts = url.pathname.startsWith('/gg/accounts');
+      const isBroadcast = url.pathname.startsWith('/gg/broadcast');
+      if (!isAccounts && !isBroadcast) {
         return new Response('Not found', { status: 404 });
       }
 
@@ -805,28 +830,59 @@ export default {
         'cache-control': 'public, max-age=120',
       };
 
-      // 암호화 + R2 업로드를 백그라운드로 돌려서(ctx.waitUntil) 응답 시간에
-      // 더해지지 않게 합니다. id는 여기서 미리 만들어 헤더에 바로 실어
-      // 보내므로, 저장이 끝나길 기다리지 않고도 /gg/img/{id} 조회용 키를
-      // 즉시 알려줄 수 있습니다.
-      //   - 배포 환경: `npx wrangler tail` 로 console.error 로그 확인
-      //   - 로컬(wrangler dev): 터미널에 바로 찍힘
-      // 주의: 저장이 실제로 끝나기 전(또는 실패한 경우)에도 헤더는 먼저
-      // 나가므로, x-image-id가 있어도 /gg/img/{id}가 아주 잠깐 404를 낼 수
-      // 있고 저장 자체가 실패하면 계속 404입니다 — 즉시 검증이 꼭 필요하면
-      // 이 백그라운드 방식 대신 예전처럼 await로 되돌리세요.
       if (env.IMAGES) {
-        const imageId = crypto.randomUUID();
+        // 같은 파라미터의 요청인지(=이미 만든 적 있는 장면인지)를 렌더링 전에
+        // 먼저 확인합니다. "이미 생성된 이미지 확대해서 다시 불러오기",
+        // "챗 히스토리 재로딩"처럼 완전히 동일한 URL이 다시 호출되는 경우가
+        // 여기서 걸러져서, 렌더링을 다시 하지 않고(CPU 절약) R2에도 중복
+        // 오브젝트가 추가되지 않습니다 — id가 파라미터로부터 결정되므로 같은
+        // 파라미터는 항상 같은 오브젝트를 가리킵니다.
+        const imageId = await canonicalRequestId(url);
         headers['x-image-id'] = imageId;
+
+        const cached = await env.IMAGES.get(imageId);
+        if (cached) {
+          const encrypted = new Uint8Array(await cached.arrayBuffer());
+          const key = await getCryptoKey(env);
+          const png = await decryptBytes(encrypted, key);
+          headers['x-image-cache'] = 'hit';
+          return new Response(png, { headers });
+        }
+
+        let png;
+        if (isAccounts) {
+          png = await withTimeout(handleAccounts(url, env), RENDER_TIMEOUT_MS, '/gg/accounts 이미지 생성');
+        } else {
+          png = await withTimeout(handleBroadcast(url, env, ctx), RENDER_TIMEOUT_MS, '/gg/broadcast 이미지 생성');
+        }
+
+        // 암호화 + R2 업로드는 백그라운드로(ctx.waitUntil) 돌려서 응답 시간에
+        // 더해지지 않게 합니다. 키가 이제 파라미터로부터 결정되므로, 같은
+        // 파라미터로 다시 저장을 시도해도 "추가"가 아니라 "같은 자리에
+        // 덮어쓰기"가 되어 R2에 사본이 쌓이지 않습니다.
+        //   - 배포 환경: `npx wrangler tail` 로 console.error 로그 확인
+        //   - 로컬(wrangler dev): 터미널에 바로 찍힘
+        // 주의: 저장이 실제로 끝나기 전(또는 실패한 경우)에도 응답은 먼저
+        // 나가므로, x-image-id가 있어도 /gg/img/{id}가 아주 잠깐 404를 낼 수
+        // 있고 저장 자체가 실패하면 계속 404입니다.
         ctx.waitUntil(
           storeEncryptedImage(env, imageId, png).catch((storeErr) => {
             console.error('[storeEncryptedImage 실패]', storeErr);
           })
         );
-      } else {
-        headers['x-image-store-skipped'] = 'no-images-binding';
+
+        headers['x-image-cache'] = 'miss';
+        return new Response(png, { headers });
       }
 
+      // IMAGES 바인딩이 없는 경우(로컬 dev 등) — 캐싱/저장 없이 매번 렌더링
+      let png;
+      if (isAccounts) {
+        png = await withTimeout(handleAccounts(url, env), RENDER_TIMEOUT_MS, '/gg/accounts 이미지 생성');
+      } else {
+        png = await withTimeout(handleBroadcast(url, env, ctx), RENDER_TIMEOUT_MS, '/gg/broadcast 이미지 생성');
+      }
+      headers['x-image-store-skipped'] = 'no-images-binding';
       return new Response(png, { headers });
     } catch (err) {
       const status = err instanceof TimeoutError ? 504 : 500;
