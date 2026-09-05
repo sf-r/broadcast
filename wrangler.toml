@@ -17,6 +17,17 @@ type = "CompiledWasm"
 globs = ["**/*.wasm"]
 fallthrough = true
 
+# Workers Cache: fetch 핸들러가 반환한 응답을 Cloudflare가 Worker 실행 전에
+# 먼저 캐시에서 확인하도록 켭니다. 판단 기준은 코드가 이미 응답에 붙이고
+# 있는 Cache-Control 헤더(public, max-age=120)이므로 별도 코드 수정 없이
+# 바로 적용됩니다. 캐시 히트 시에는 satori 렌더링은 물론 R2 조회(SHA-256
+# 해시 계산 + 복호화)까지 전부 건너뛰어 Worker가 아예 실행되지 않습니다 —
+# README의 "이미지 확대해서 다시 불러오기", "채팅 히스토리 재로딩" 같은
+# 동일 파라미터 재요청 시나리오에 정확히 맞는 최적화입니다.
+# (Wrangler 4.69.0 이상 필요 — package.json 참고)
+[cache]
+enabled = true
+
 # 아바타 이미지를 다른 도메인/버킷에서 서빙한다면 여기에 지정
 # (지정 안 하면 코드에서 {origin}/avatars 를 기본값으로 사용)
 [vars]

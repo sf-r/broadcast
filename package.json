@@ -13,6 +13,6 @@
     "subset-font": "^2.5.0"
   },
   "devDependencies": {
-    "wrangler": "^3.78.0"
+    "wrangler": "^4.69.0"
   }
 }
