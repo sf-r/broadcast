@@ -9,8 +9,7 @@
   "dependencies": {
     "satori": "^0.10.13",
     "satori-html": "^0.3.2",
-    "@resvg/resvg-wasm": "^2.6.2",
-    "subset-font": "^2.5.0"
+    "@resvg/resvg-wasm": "^2.6.2"
   },
   "devDependencies": {
     "wrangler": "^4.69.0"

@@ -39,11 +39,6 @@ import satori from 'satori';
 import { html } from 'satori-html';
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
 import resvgWasm from '@resvg/resvg-wasm/index_bg.wasm';
-// harfbuzz(wasm) 기반 폰트 서브셋터. 매 요청마다 "실제로 그릴 글자"만 남긴
-// 훨씬 작은 임시 폰트를 만들어 satori에 넘기기 위해 씁니다 (CPU 타임아웃 대응,
-// 아래 subsetFontsForMarkup 참고). nodejs_compat 플래그(wrangler.toml)가 켜져
-// 있어야 Buffer 전역이 존재합니다.
-import subsetFont from 'subset-font';
 
 // ------------------------------------------------------------------
 // 공통 유틸
@@ -219,79 +214,29 @@ function iconTag(svg, size, extraStyle = '') {
 }
 
 // ------------------------------------------------------------------
-// 폰트 서브셋팅 (CPU 타임아웃 대응 핵심)
+// (폰트 서브셋팅은 제거됨 — 2026-09 업데이트)
 // ------------------------------------------------------------------
 //
-// Pretendard 풀 OTF는 완성형 한글 11,172자를 전부 담고 있는 대용량 CJK
-// 폰트입니다. satori는 fonts에 넘긴 ArrayBuffer를 매 호출마다 처음부터 다시
-// 파싱하는데(파싱 결과를 재사용할 방법이 없음 — fontCache는 "원본 바이트"만
-// 캐싱하고 있어서 파싱 자체는 매번 새로 일어남), 이 파싱 비용이 요청 하나가
-// CPU 타임아웃(플랫폼 하드 캡)에 부딪히는 유력한 원인입니다.
+// 예전에는 satori에 넘기기 전에 subset-font(harfbuzzjs 기반)로 "이 요청에
+// 실제로 쓰이는 글자"만 남긴 임시 폰트를 만들어 CPU 타임아웃을 줄이려
+// 했습니다. 하지만 이 최적화는 두 가지 문제가 있었습니다:
+//   1) subset-font가 내부적으로 WOFF/WOFF2 변환용 fontverter -> wawoff2를
+//      물고 오는데, 이 체인이 모듈 require 시점에 Node의 __dirname을
+//      참조합니다. Cloudflare Workers 런타임(workerd)은 __dirname을
+//      지원하지 않아서, wrangler를 4.x로 올리자 배포 자체가
+//      "Uncaught ReferenceError: __dirname is not defined"로 실패했습니다.
+//      (우리는 targetFormat: 'sfnt'만 쓰므로 WOFF 변환 기능은 애초에 필요
+//      없었는데도, subset-font가 무조건 그 의존성을 불러오면서 생긴 문제.)
+//   2) 그 이전에도(wrangler 3.x 환경) harfbuzzjs wasm 로딩이 이 환경에서
+//      100% 안정적이지 않아, 실제로는 거의 매 요청 "서브셋 실패 -> 풀 폰트
+//      폴백"으로 빠지고 있었습니다 — 즉 최적화가 이미 제 역할을 못 하고
+//      있었습니다.
 //
-// 해결책: 어차피 화면 하나에 실제로 쓰이는 글자는 title/streamer/닉네임/
-// 채팅/후원 문구를 다 합쳐도 보통 수십~백여 자 수준입니다. satori에 넘기기
-// 직전에 harfbuzz(wasm) 기반 서브셋터로 "이 요청에 실제로 그려질 글자"만
-// 남긴 훨씬 작은 임시 폰트를 만들어서 넘기면, satori/opentype 파싱 비용이
-// 요청마다 필요한 글자 수에 비례하게 줄어듭니다(11,172자 전체 파싱 → 수십~
-// 백여 자 파싱).
-//
-// 안전장치: 이 환경(Cloudflare Workers)에서 subset-font가 내부적으로 쓰는
-// harfbuzzjs wasm 로딩이 100% 보장된 건 아니라서, 실패하면 조용히 "서브셋 안
-// 하고 원본 풀 폰트 그대로 사용"으로 폴백합니다 — 즉 이 최적화가 무슨 이유로
-// 안 먹히더라도 지금처럼 동작은 계속 되고, 다만 최적화 이전 상태로 돌아갈
-// 뿐입니다. 배포 전 `npx wrangler dev`로 실제 서브셋이 성공하는지
-// (`font subset` 로그가 찍히는지, 에러가 안 나는지) 꼭 한 번 확인하세요.
-
-function toArrayBuffer(bufferLikeOrArrayBuffer) {
-  if (bufferLikeOrArrayBuffer instanceof ArrayBuffer) return bufferLikeOrArrayBuffer;
-  // Node Buffer / Uint8Array는 더 큰 풀링된 ArrayBuffer의 일부(view)일 수
-  // 있으므로, byteOffset/byteLength 기준으로 정확히 잘라내야 satori가
-  // 엉뚱한 바이트를 읽지 않습니다.
-  const view = bufferLikeOrArrayBuffer;
-  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
-}
-
-/** 최종 HTML 문자열에서 태그(스타일 속성 포함)를 걷어내고 남는, 실제로
- * 화면에 렌더링될 글자만 뽑아냅니다. 수동으로 "고정 텍스트 목록"을 관리할
- * 필요가 없어서, 나중에 템플릿 문구(LIVE/팔로잉/후원 문구 등)가 바뀌어도
- * 자동으로 반영됩니다. */
-function extractRenderableChars(markupHtml) {
-  const text = markupHtml.replace(/<[^>]*>/g, '');
-  return Array.from(new Set(text)).join('');
-}
-
-async function subsetFontsForMarkup(fonts, markupHtml) {
-  const chars = extractRenderableChars(markupHtml);
-  if (!chars) return fonts;
-  try {
-    console.log(`[broadcast]   font subset 시작 (chars=${chars.length}, weights=${fonts.length})`);
-    const subsetted = await Promise.all(
-      fonts.map(async (f) => {
-        console.log(`[broadcast]     subsetFont 시작 weight=${f.weight}`);
-        const result = {
-          ...f,
-          data: toArrayBuffer(
-            await subsetFont(Buffer.from(f.data), chars, { targetFormat: 'sfnt' })
-          ),
-        };
-        console.log(`[broadcast]     subsetFont 완료 weight=${f.weight}`);
-        return result;
-      })
-    );
-    console.log('[broadcast]   font subset 완료');
-    return subsetted;
-  } catch (err) {
-    // 서브셋 실패해도 렌더링은 계속 진행 — 원본(풀) 폰트로 폴백합니다.
-    // 이 폴백 자체는 기능적으로 문제가 없으므로(이미지는 정상 생성됨)
-    // error가 아니라 warn 레벨로 남겨서 Cloudflare 대시보드의 에러 집계/
-    // 알림에 잡히지 않게 합니다. 원인 진단용으로 실제 에러 메시지만 짧게
-    // 붙입니다 — 이 로그가 반복해서 계속 찍히면(=서브셋이 매번 실패하면)
-    // CPU 타임아웃 방지 최적화가 무력화된 상태라는 뜻이니 그때는 원인을
-    // 들여다볼 필요가 있습니다.
-    console.warn(`[font subset 스킵, 풀 폰트로 폴백] ${err?.message || err}`);
-    return fonts;
-  }
-}
+// 그래서 서브셋팅 자체를 걷어내고 항상 풀 Pretendard 폰트로 렌더링합니다.
+// CPU 타임아웃은 여전히 RENDER_TIMEOUT_MS(아래)와 wrangler.toml의
+// [limits] cpu_ms가 안전망 역할을 하고, 반복되는 동일 파라미터 요청은
+// wrangler.toml의 [cache] 설정(Workers Cache)이 렌더링 자체를 건너뛰게
+// 해주므로 실질적인 CPU 부담은 이전보다 오히려 줄었습니다.
 
 // ------------------------------------------------------------------
 // CPU 타임아웃 안전장치
@@ -473,8 +418,7 @@ async function handleAccounts(url, env) {
   const markupStr = renderAccountsMarkup({ title, dir, accounts, avatarBase });
   // html()을 "함수 호출"로 사용 — 완성된 문자열을 그대로 파싱, 자동 이스케이프 없음
   const markup = html(markupStr);
-  const renderFonts = await subsetFontsForMarkup(fonts, markupStr);
-  const svg = await satori(markup, { width: ACCOUNTS_WIDTH, fonts: renderFonts });
+  const svg = await satori(markup, { width: ACCOUNTS_WIDTH, fonts });
   return svgToPng(svg, ACCOUNTS_WIDTH);
 }
 
@@ -658,8 +602,8 @@ async function handleBroadcast(url, env, ctx) {
   const bgUrl = `${bgBase.replace(/\/$/, '')}/bro/${encodeURIComponent(char)}-${encodeURIComponent(situation)}.png`;
 
   // --- 타이밍 계측 시작 -----------------------------------------------
-  // 어느 단계(폰트+배경이미지 로딩 / 폰트 서브셋 / satori 레이아웃 / resvg
-  // 래스터라이즈)가 CPU 시간을 잡아먹는지 확정하기 위한 체크포인트 로그.
+  // 어느 단계(폰트+배경이미지 로딩 / satori 레이아웃 / resvg 래스터라이즈)가
+  // CPU 시간을 잡아먹는지 확정하기 위한 체크포인트 로그.
   //
   // 주의: console.time()은 "호출 시점"엔 아무 로그도 안 남기고, 반드시
   // console.timeEnd()까지 끝나야만 한 줄이 찍힙니다. 그래서 CPU 한도로
@@ -699,14 +643,8 @@ async function handleBroadcast(url, env, ctx) {
   // 파서를 거치지 않고, 파싱된 VDOM 트리에서 자리표시자를 실제 데이터 URI로 교체
   replaceImgSrc(markup, BG_IMG_PLACEHOLDER, bgDataUri);
 
-  // satori에 넘기기 직전, 이 화면에 실제로 쓰이는 글자만 남긴 서브셋 폰트로
-  // 교체 — CPU 타임아웃의 유력 원인이었던 "매 요청 풀 폰트 파싱"을 줄입니다.
-  console.log('[broadcast] step: font subset 시작');
-  const renderFonts = await subsetFontsForMarkup(fonts, markupStr);
-  console.log('[broadcast] step: font subset 완료');
-
   console.log('[broadcast] step: satori 시작');
-  const svg = await satori(markup, { width, height, fonts: renderFonts });
+  const svg = await satori(markup, { width, height, fonts });
   console.log('[broadcast] step: satori 완료');
 
   console.log('[broadcast] step: resvg 시작');
