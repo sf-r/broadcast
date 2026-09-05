@@ -132,6 +132,28 @@ function escapeHtml(s) {
     .replaceAll('"', '&quot;');
 }
 
+// url.searchParams.get()이 쿼리스트링 전체를 이미 한 번 디코딩해주기 때문에,
+// chat/donation/accounts처럼 ':'나 '|'로 다시 split한 뒤 조각마다
+// decodeURIComponent()를 또 거는 코드는 사실상 "이중 디코딩"을 기대하는
+// 구조입니다. 호출부(AI 응답)가 원문 그대로 넣든, 한 번만 encodeURIComponent
+// 하든, 필드별로 개별 encodeURIComponent 해서 이어붙이든 — 어떤 방식으로
+// 오든 깨지지 않게 하기 위한 안전한 디코더입니다.
+//   - 정상적으로 디코딩되면 그 결과를 반환
+//   - 디코딩할 % 시퀀스가 없으면(=원문 그대로 왔거나 이미 다 풀린 경우)
+//     decodeURIComponent가 입력을 그대로 반환하므로 별문제 없음
+//   - '%' 뒤에 잘못된 시퀀스가 와서(예: 메시지에 우연히 포함된 "50%" 같은
+//     literal '%') decodeURIComponent가 URIError를 던지면, 그 예외를 삼키고
+//     "디코딩 시도 전 원본 문자열"을 그대로 돌려줍니다 — 요청을 500으로
+//     죽이는 대신 최대한 원문에 가까운 값으로 계속 렌더링을 이어갑니다.
+function safeDecodeURIComponent(s) {
+  if (!s) return '';
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 // 배경 이미지 자리표시자 — renderBroadcastMarkup()이 만드는 HTML 문자열에는
 // 이 짧은 문자열만 들어가고, 실제 base64 데이터 URI는 html() 파싱이 끝난
 // 뒤 replaceImgSrc()로 VDOM 트리에 직접 주입합니다.
@@ -381,11 +403,11 @@ function parseAccounts(raw) {
     .map((entry) => {
       const [name, bio, followers, verified, handle] = entry.split(':');
       return {
-        name: decodeURIComponent(name || ''),
-        bio: decodeURIComponent(bio || ''),
+        name: safeDecodeURIComponent(name || ''),
+        bio: safeDecodeURIComponent(bio || ''),
         followers: Number(followers) || 0,
         verified: verified === '1',
-        handle: decodeURIComponent(handle || ''),
+        handle: safeDecodeURIComponent(handle || ''),
       };
     });
 }
@@ -478,7 +500,7 @@ function parseChat(raw) {
     .filter(Boolean)
     .map((entry) => {
       const [nick, msg] = entry.split(':');
-      return { nick: decodeURIComponent(nick || ''), msg: decodeURIComponent(msg || '') };
+      return { nick: safeDecodeURIComponent(nick || ''), msg: safeDecodeURIComponent(msg || '') };
     })
     .slice(-CHAT_MAX_LINES);
 }
@@ -488,9 +510,9 @@ function parseDonation(raw) {
   const [nick, amount, content] = raw.split(':');
   if (!nick) return null;
   return {
-    nick: decodeURIComponent(nick),
+    nick: safeDecodeURIComponent(nick),
     amount: Number(amount) || 0,
-    content: decodeURIComponent(content || ''),
+    content: safeDecodeURIComponent(content || ''),
   };
 }
 
